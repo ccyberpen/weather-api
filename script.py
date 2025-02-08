@@ -10,7 +10,6 @@ import asyncio
 
 DATABASE_PATH = "weather.db"# Путь к базе данных
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"# URL API для прогноза
-GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"# URL API для нахождения координат города
 UPDATE_INTERVAL = 900  # 15 минут
 
 # Класс города
@@ -115,20 +114,50 @@ async def update_forecasts():
 
             for city in cities:
                 city_name, latitude, longitude = city
+
                 try:
-                    # Удаляем старые прогнозы для этого города и пользователя
-                    await db.execute(
-                        "DELETE FROM forecasts WHERE user_id = ? AND city_name = ?",
+                    # Получаем новые данные о погоде
+                    weather_data = await get_current_weather(latitude, longitude)
+                    current_time = datetime.datetime.now().strftime("%H:%M")
+
+                    # Проверяем, существует ли запись
+                    cursor = await db.execute(
+                        "SELECT COUNT(*) FROM forecasts WHERE user_id = ? AND city_name = ?",
                         (user_id, city_name)
                     )
-                    
-                    # Получаем и сохраняем новые данные
-                    weather_data = await get_current_weather(latitude, longitude)
-                    await db.execute(
-                        "INSERT INTO forecasts (user_id, city_name, time, temperature, windspeed, pressure) VALUES (?, ?, ?, ?, ?, ?)",
-                        (user_id, city_name, datetime.datetime.now().strftime("%H:%M"),
-                        weather_data.temperature, weather_data.windspeed, weather_data.pressure)
-                    )
+                    count = await cursor.fetchone()
+
+                    if count[0] > 0:
+                        # Если запись существует, обновляем ее
+                        await db.execute(
+                            """
+                            UPDATE forecasts 
+                            SET time = ?, 
+                                temperature = ?, 
+                                windspeed = ?, 
+                                pressure = ?
+                            WHERE user_id = ? AND city_name = ?
+                            """,
+                            (current_time, 
+                             weather_data.temperature, 
+                             weather_data.windspeed, 
+                             weather_data.pressure,
+                             user_id, 
+                             city_name)
+                        )
+                    else:
+                        # Если записи нет, создаем новую
+                        await db.execute(
+                            """
+                            INSERT INTO forecasts 
+                            (user_id, city_name, time, temperature, windspeed, pressure) 
+                            VALUES (?, ?, ?, ?, ?, ?)
+                            """,
+                            (user_id, city_name, current_time,
+                             weather_data.temperature, weather_data.windspeed, 
+                             weather_data.pressure)
+                        )
+
                     await db.commit()
                     print(f"Data for {city_name} (user {user_id}) updated")
                 except Exception as e:
@@ -217,29 +246,6 @@ async def get_tracked_cities(user_id: int):
         raise HTTPException(status_code=404, detail="No cities tracked for this user")
     return [city[0] for city in cities]
 
-# Метод для получения координат города
-async def get_city_coords(city_name: str):
-    # Параметры для GET запроса
-    params={
-        "name":city_name,
-        "count": 1,
-        "language": "en",
-        "format": "json"
-    }
-    # Получение координат по названию города
-    async with httpx.AsyncClient() as client:
-        response = await client.get(GEOCODING_URL, params=params)
-        response.raise_for_status()
-        data = response.json()
-    if "results" not in data:
-        raise HTTPException(status_code=400,detail="Invalid city name")
-    else:
-        coords = {
-            "latitude": data["results"][0]["latitude"],
-            "longitude": data["results"][0]["longitude"]
-        }
-   
-    return coords
 
 # Метод принимает название города и время и возвращает для него погоду на текущий день в указанное время
 @app.get("/weather_forecast")
@@ -257,6 +263,11 @@ async def get_weather_forecast(user_id: int,city_name: str, time: str, parameter
         )
         if not await cursor.fetchone():
             raise HTTPException(status_code=404, detail="City not tracked by this user")
+        cursor = await db.execute(
+            "SELECT latitude, longitude FROM cities WHERE user_id = ? AND city_name = ?",
+            (user_id, city_name)
+        )
+        city_data = await cursor.fetchone()
     try:
         request_time = datetime.datetime.strptime(time, "%H:%M")
     except ValueError:
@@ -265,7 +276,10 @@ async def get_weather_forecast(user_id: int,city_name: str, time: str, parameter
     if(len(time)!=5):
         raise HTTPException(status_code=400, detail="Invalid time format. Use HH:MM")
     # Получение координат города
-    coords = await get_city_coords(city_name)
+    coords = {
+        "latitude": city_data[0],
+        "longitude": city_data[1]
+    }
     if not coords:
         raise HTTPException(status_code=404, detail="City not found")
 
@@ -280,7 +294,6 @@ async def get_weather_forecast(user_id: int,city_name: str, time: str, parameter
 
     # Формирование текущей даты и времени для запроса
     current_date = datetime.datetime.now().strftime("%Y-%m-%d")
-    search_time = f"{current_date}T{time}:00"
 
     # Формирование запроса к Open-Meteo API
     params = {
