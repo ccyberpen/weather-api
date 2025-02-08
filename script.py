@@ -23,24 +23,42 @@ class WeatherData(BaseModel):
     temperature: float = None # Температура
     windspeed: float = None # Скорость ветра
     pressure: float = None # Атмосферное давление
+class User(BaseModel):
+    username: str
 
 # Создание таблицы базы данных
 async def create_db():
     async with aiosqlite.connect(DATABASE_PATH) as db:
+        # Таблица пользователей
         await db.execute('''
-            CREATE TABLE IF NOT EXISTS cities (
-                city_name TEXT PRIMARY KEY,
-                latitude REAL,
-                longitude REAL
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL
             )
         ''')
+        # Таблица городов
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS cities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                city_name TEXT,
+                latitude REAL,
+                longitude REAL,
+                FOREIGN KEY (user_id) REFERENCES users (user_id),
+                UNIQUE(user_id, city_name)
+            )
+        ''')
+        # Таблица прогнозов
         await db.execute('''
             CREATE TABLE IF NOT EXISTS forecasts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
                 city_name TEXT,
                 time TEXT,
                 temperature REAL,
                 windspeed REAL,
                 pressure REAL,
+                FOREIGN KEY (user_id) REFERENCES users (user_id),
                 FOREIGN KEY (city_name) REFERENCES cities (city_name)
             )
         ''')
@@ -52,34 +70,62 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(update_forecasts_loop())
     yield
 app = FastAPI(lifespan=lifespan)
+# Регистриация пользователя
+@app.post("/register")
+async def register_user(user: User):
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        try:
+            cursor = await db.execute(
+                "INSERT INTO users (username) VALUES (?) RETURNING user_id",
+                (user.username,)
+            )
+            user_id = await cursor.fetchone()
+            await db.commit()
+            return {"user_id": user_id[0], "username": user.username}
+        except aiosqlite.IntegrityError:
+            raise HTTPException(status_code=400, detail="Username already exists")
 # Обновление у городов из БД данных о погоде
 async def update_forecasts():
-    
     async with aiosqlite.connect(DATABASE_PATH) as db:
-        # Проверка, пуста ли таблица cities
-        cursor = await db.execute("SELECT COUNT(*) FROM cities")
-        count = await cursor.fetchone()
-        # Если в таблице нет городов
-        if count[0] == 0:
-            print("No cities to update forecasts for")
+        # Получаем всех пользователей
+        cursor = await db.execute("SELECT user_id FROM users")
+        users = await cursor.fetchall()
+        
+        if not users:
+            print("No users found")
             return
 
-        # Получаем список городов
-        cursor = await db.execute("SELECT city_name, latitude, longitude FROM cities")
-        cities = await cursor.fetchall()
+        for user in users:
+            user_id = user[0]
+            
+            # Получаем города пользователя
+            cursor = await db.execute(
+                "SELECT city_name, latitude, longitude FROM cities WHERE user_id = ?",
+                (user_id,)
+            )
+            cities = await cursor.fetchall()
 
-        for city in cities:
-            city_name, latitude, longitude = city
+            if not cities:
+                continue
 
-            # Удаляем старые прогнозы для этого города
-            await db.execute("DELETE FROM forecasts WHERE city_name = ?", (city_name,))
-            # Получаем погоду на текущий момет
-            weather_data = await get_current_weather(latitude,longitude)
-            await db.execute(
-                "INSERT INTO forecasts (city_name, time,temperature, windspeed, pressure) VALUES (?, ?, ?, ?, ?)",
-                    (city_name, datetime.datetime.now().strftime("%H:%M"), weather_data.temperature, weather_data.windspeed, weather_data.pressure))
-            await db.commit()
-            print(f"Data for {city_name} updated")
+            for city in cities:
+                city_name, latitude, longitude = city
+
+                # Удаляем старые прогнозы для этого города и пользователя
+                await db.execute(
+                    "DELETE FROM forecasts WHERE user_id = ? AND city_name = ?",
+                    (user_id, city_name)
+                )
+                
+                # Получаем и сохраняем новые данные
+                weather_data = await get_current_weather(latitude, longitude)
+                await db.execute(
+                    "INSERT INTO forecasts (user_id, city_name, time, temperature, windspeed, pressure) VALUES (?, ?, ?, ?, ?, ?)",
+                    (user_id, city_name, datetime.datetime.now().strftime("%H:%M"),
+                     weather_data.temperature, weather_data.windspeed, weather_data.pressure)
+                )
+                await db.commit()
+                print(f"Data for {city_name} (user {user_id}) updated")
 # Обновление данных о погоде каждые 15 минут
 async def update_forecasts_loop():
     while True:
@@ -125,24 +171,39 @@ async def get_current_weather(latitude: float, longitude: float):
         )
 # Добавление города в список отслеживаемых
 @app.post("/add_city")
-async def add_city(city: City):
+async def add_city(city: City, user_id: int):
+    # Проверка существования пользователя
     async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute("SELECT user_id FROM users WHERE user_id = ?", (int(user_id), ))
+        if not await cursor.fetchone():
+            raise HTTPException(status_code=404, detail="User not found")
+
         try:
-            await db.execute("INSERT INTO cities (city_name, latitude, longitude) VALUES (?, ?, ?)",
-                             (city.city_name, city.latitude, city.longitude))
+            await db.execute(
+                "INSERT INTO cities (user_id, city_name, latitude, longitude) VALUES (?, ?, ?, ?)",
+                (user_id, city.city_name, city.latitude, city.longitude)
+            )
             await db.commit()
         except aiosqlite.IntegrityError:
-            raise HTTPException(status_code=400, detail="City already exists")
+            raise HTTPException(status_code=400, detail="City already exists for this user")
     return {"message": "City added successfully"}
 # Получение списка отслеживаемых городов
 @app.get("/tracked_cities")
-async def get_tracked_cities():
+async def get_tracked_cities(user_id: int):
     async with aiosqlite.connect(DATABASE_PATH) as db:
-        cursor = await db.execute("SELECT city_name FROM cities")
+        # Проверка существования пользователя
+        cursor = await db.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
+        if not await cursor.fetchone():
+            raise HTTPException(status_code=404, detail="User not found")
+
+        cursor = await db.execute(
+            "SELECT city_name FROM cities WHERE user_id = ?",
+            (user_id,)
+        )
         cities = await cursor.fetchall()
-    # Если таблица пустая
+    
     if len(cities) < 1:
-        raise HTTPException(status_code=404, detail="Table 'cities' is empty")
+        raise HTTPException(status_code=404, detail="No cities tracked for this user")
     return [city[0] for city in cities]
 
 # Метод для получения координат города
@@ -170,7 +231,20 @@ async def get_city_coords(city_name: str):
     return coords
 # Метод принимает название города и время и возвращает для него погоду на текущий день в указанное время
 @app.get("/weather_forecast")
-async def get_weather_forecast(city_name: str, time: str, parameters: Optional[str] = None):
+async def get_weather_forecast(user_id: int,city_name: str, time: str, parameters: Optional[str] = None):
+    # Проверка существования пользователя
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
+        if not await cursor.fetchone():
+            raise HTTPException(status_code=404, detail="User not found")
+
+        # Проверка, отслеживает ли пользователь этот город
+        cursor = await db.execute(
+            "SELECT city_name FROM cities WHERE user_id = ? AND city_name = ?",
+            (user_id, city_name)
+        )
+        if not await cursor.fetchone():
+            raise HTTPException(status_code=404, detail="City not tracked by this user")
     try:
         request_time = datetime.datetime.strptime(time, "%H:%M")
     except ValueError:
