@@ -20,9 +20,9 @@ class City(BaseModel):
     longitude: float # Долгота
 
 class WeatherData(BaseModel):
-    temperature: float = None # Температура
-    windspeed: float = None # Скорость ветра
-    pressure: float = None # Атмосферное давление
+    temperature: float  # Температура
+    windspeed: float  # Скорость ветра
+    pressure: float  # Атмосферное давление
 class User(BaseModel):
     username: str
 
@@ -63,13 +63,17 @@ async def create_db():
             )
         ''')
         await db.commit()
-# Метод, определяющие действия при запусе скрипта
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # При запуске скрипта
     await create_db()
     asyncio.create_task(update_forecasts_loop())
     yield
+    # После завершения работы
+    # ....
+
 app = FastAPI(lifespan=lifespan)
+
 # Регистриация пользователя
 @app.post("/register")
 async def register_user(user: User):
@@ -84,6 +88,7 @@ async def register_user(user: User):
             return {"user_id": user_id[0], "username": user.username}
         except aiosqlite.IntegrityError:
             raise HTTPException(status_code=400, detail="Username already exists")
+
 # Обновление у городов из БД данных о погоде
 async def update_forecasts():
     async with aiosqlite.connect(DATABASE_PATH) as db:
@@ -110,27 +115,31 @@ async def update_forecasts():
 
             for city in cities:
                 city_name, latitude, longitude = city
+                try:
+                    # Удаляем старые прогнозы для этого города и пользователя
+                    await db.execute(
+                        "DELETE FROM forecasts WHERE user_id = ? AND city_name = ?",
+                        (user_id, city_name)
+                    )
+                    
+                    # Получаем и сохраняем новые данные
+                    weather_data = await get_current_weather(latitude, longitude)
+                    await db.execute(
+                        "INSERT INTO forecasts (user_id, city_name, time, temperature, windspeed, pressure) VALUES (?, ?, ?, ?, ?, ?)",
+                        (user_id, city_name, datetime.datetime.now().strftime("%H:%M"),
+                        weather_data.temperature, weather_data.windspeed, weather_data.pressure)
+                    )
+                    await db.commit()
+                    print(f"Data for {city_name} (user {user_id}) updated")
+                except Exception as e:
+                    print(f"Failed to update weather for {city_name} (user {user_id}): {str(e)}")
 
-                # Удаляем старые прогнозы для этого города и пользователя
-                await db.execute(
-                    "DELETE FROM forecasts WHERE user_id = ? AND city_name = ?",
-                    (user_id, city_name)
-                )
-                
-                # Получаем и сохраняем новые данные
-                weather_data = await get_current_weather(latitude, longitude)
-                await db.execute(
-                    "INSERT INTO forecasts (user_id, city_name, time, temperature, windspeed, pressure) VALUES (?, ?, ?, ?, ?, ?)",
-                    (user_id, city_name, datetime.datetime.now().strftime("%H:%M"),
-                     weather_data.temperature, weather_data.windspeed, weather_data.pressure)
-                )
-                await db.commit()
-                print(f"Data for {city_name} (user {user_id}) updated")
 # Обновление данных о погоде каждые 15 минут
 async def update_forecasts_loop():
     while True:
         await update_forecasts()
         await asyncio.sleep(UPDATE_INTERVAL)
+
 # Получение информации о погоде по широте и долготе
 @app.get("/current_weather", response_model=WeatherData)
 async def get_current_weather(latitude: float, longitude: float):
@@ -169,6 +178,7 @@ async def get_current_weather(latitude: float, longitude: float):
             status_code=500,
             detail=f"An error occurred: {str(e)}"
         )
+
 # Добавление города в список отслеживаемых
 @app.post("/add_city")
 async def add_city(city: City, user_id: int):
@@ -187,6 +197,7 @@ async def add_city(city: City, user_id: int):
         except aiosqlite.IntegrityError:
             raise HTTPException(status_code=400, detail="City already exists for this user")
     return {"message": "City added successfully"}
+
 # Получение списка отслеживаемых городов
 @app.get("/tracked_cities")
 async def get_tracked_cities(user_id: int):
@@ -229,6 +240,7 @@ async def get_city_coords(city_name: str):
         }
    
     return coords
+
 # Метод принимает название города и время и возвращает для него погоду на текущий день в указанное время
 @app.get("/weather_forecast")
 async def get_weather_forecast(user_id: int,city_name: str, time: str, parameters: Optional[str] = None):
