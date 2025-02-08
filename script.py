@@ -366,7 +366,6 @@ if __name__ == "__main__":
 # Тесты для API
 import pytest
 import pytest_asyncio
-from httpx import AsyncClient
 import os
 
 @pytest_asyncio.fixture(scope="module")
@@ -377,7 +376,7 @@ async def test_app_fixture():
     DATABASE_PATH = test_db
     await create_db()
     # Запускаем приложение в тестовом клиенте
-    async with AsyncClient(app=app, base_url="http://test") as ac:
+    async with httpx.AsyncClient(app=app, base_url="http://127.0.0.1:8000") as ac:
         yield ac
     # Удаляем тестовую базу данных после тестов
     if os.path.exists(test_db):
