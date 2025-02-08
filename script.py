@@ -1,5 +1,4 @@
 import datetime
-import json
 from typing import Optional
 from fastapi import FastAPI, HTTPException
 import aiosqlite
@@ -172,13 +171,12 @@ async def update_forecasts_loop():
 # Получение информации о погоде по широте и долготе
 @app.get("/current_weather", response_model=WeatherData)
 async def get_current_weather(latitude: float, longitude: float):
-    
-    try:    
-        if not (-90 <= latitude <= 90) or not (-180 <= longitude <= 180):
+    if (not (-90 <= latitude <= 90)) or (not (-180 <= longitude <= 180)):
                 raise HTTPException(
                     status_code=400,
                     detail="Invalid coordinates. Latitude must be between -90 and 90, longitude between -180 and 180"
                 )
+    try:    
         # Параметры для GET запроса
         params = {
             "latitude": latitude,
@@ -192,6 +190,8 @@ async def get_current_weather(latitude: float, longitude: float):
             response.raise_for_status()
             data = response.json()
         current_weather = data["current"]
+        if not current_weather:
+            raise HTTPException(status_code=404, detail="Current weather data not available") 
         return WeatherData(
             temperature=current_weather["temperature_2m"],
             windspeed=current_weather["wind_speed_10m"],
@@ -361,3 +361,178 @@ async def get_weather_forecast(user_id: int,city_name: str, time: str, parameter
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=8000,lifespan="on")
+# --------------------- Тесты ниже ---------------------
+
+# Тесты для API
+import pytest
+import pytest_asyncio
+from httpx import AsyncClient
+import os
+
+@pytest_asyncio.fixture(scope="module")
+async def test_app_fixture():
+    # Создаем тестовую базу данных
+    test_db = "test_weather.db"
+    global DATABASE_PATH
+    DATABASE_PATH = test_db
+    await create_db()
+    # Запускаем приложение в тестовом клиенте
+    async with AsyncClient(app=app, base_url="http://test") as ac:
+        yield ac
+    # Удаляем тестовую базу данных после тестов
+    if os.path.exists(test_db):
+        os.remove(test_db)
+
+@pytest.mark.asyncio
+async def test_register_user(test_app_fixture):
+    response = await test_app_fixture.post("/register", json={"username": "testuser"})
+    assert response.status_code == 200
+    data = response.json()
+    assert data["username"] == "testuser"
+    assert "user_id" in data
+
+    # Попытка зарегистрировать того же пользователя снова
+    response = await test_app_fixture.post("/register", json={"username": "testuser"})
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Username already exists"
+
+@pytest.mark.asyncio
+async def test_add_city(test_app_fixture):
+    # Сначала зарегистрируем пользователя
+    response = await test_app_fixture.post("/register", json={"username": "cityuser"})
+    assert response.status_code == 200
+    user_id = response.json()["user_id"]
+
+    # Добавляем город
+    city_data = {
+        "city_name": "Moscow",
+        "latitude": 55.7558,
+        "longitude": 37.6173
+    }
+    response = await test_app_fixture.post("/add_city", params={"user_id": user_id}, json=city_data)
+    assert response.status_code == 200
+    assert response.json()["message"] == "City added successfully"
+
+    # Попытка добавить тот же город снова
+    response = await test_app_fixture.post("/add_city", params={"user_id": user_id}, json=city_data)
+    assert response.status_code == 400
+    assert response.json()["detail"] == "City already exists for this user"
+
+    # Попытка добавить город для несуществующего пользователя
+    response = await test_app_fixture.post("/add_city", params={"user_id": 999}, json=city_data)
+    assert response.status_code == 404
+    assert response.json()["detail"] == "User not found"
+
+@pytest.mark.asyncio
+async def test_get_tracked_cities(test_app_fixture):
+    # Регистрируем пользователя и добавляем города
+    response = await test_app_fixture.post("/register", json={"username": "trackeduser"})
+    assert response.status_code == 200
+    user_id = response.json()["user_id"]
+
+    cities = [
+        {"city_name": "New York", "latitude": 40.7128, "longitude": -74.0060},
+        {"city_name": "Los Angeles", "latitude": 34.0522, "longitude": -118.2437}
+    ]
+
+    for city in cities:
+        response = await test_app_fixture.post("/add_city", params={"user_id": user_id}, json=city)
+        assert response.status_code == 200
+
+    # Получаем список отслеживаемых городов
+    response = await test_app_fixture.get("/tracked_cities", params={"user_id": user_id})
+    assert response.status_code == 200
+    assert set(response.json()) == {"New York", "Los Angeles"}
+
+    # Получение городов для пользователя без отслеживаемых городов
+    response = await test_app_fixture.post("/register", json={"username": "emptyuser"})
+    assert response.status_code == 200
+    empty_user_id = response.json()["user_id"]
+
+    response = await test_app_fixture.get("/tracked_cities", params={"user_id": empty_user_id})
+    assert response.status_code == 404
+    assert response.json()["detail"] == "No cities tracked for this user"
+
+    # Попытка получить города для несуществующего пользователя
+    response = await test_app_fixture.get("/tracked_cities", params={"user_id": 999})
+    assert response.status_code == 404
+    assert response.json()["detail"] == "User not found"
+
+@pytest.mark.asyncio
+async def test_get_current_weather(test_app_fixture):
+    # Используем известные координаты
+    latitude = 55.7558  # Москва
+    longitude = 37.6173
+
+    response = await test_app_fixture.get("/current_weather", params={"latitude": latitude, "longitude": longitude})
+    if response.status_code == 200:
+        data = response.json()
+        assert "temperature" in data
+        assert "windspeed" in data
+        assert "pressure" in data
+    else:
+        # В случае проблем с API можно пропустить тест
+        assert response.status_code in [500, 503, 404]
+
+    # Тест с неверными координатами
+    response = await test_app_fixture.get("/current_weather", params={"latitude": 100, "longitude": 200})
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Invalid coordinates. Latitude must be between -90 and 90, longitude between -180 and 180"
+
+@pytest.mark.asyncio
+async def test_get_weather_forecast(test_app_fixture):
+    # Регистрируем пользователя и добавляем город
+    response = await test_app_fixture.post("/register", json={"username": "forecastuser"})
+    assert response.status_code == 200
+    user_id = response.json()["user_id"]
+
+    city_data = {
+        "city_name": "Berlin",
+        "latitude": 52.5200,
+        "longitude": 13.4050
+    }
+    response = await test_app_fixture.post("/add_city", params={"user_id": user_id}, json=city_data)
+    assert response.status_code == 200
+
+    # Запрашиваем прогноз
+    current_time = datetime.datetime.now().strftime("%H:%M")
+    response = await test_app_fixture.get("/weather_forecast", params={
+        "user_id": user_id,
+        "city_name": "Berlin",
+        "time": current_time
+    })
+
+    if response.status_code == 200:
+        data = response.json()
+        # Проверяем наличие хотя бы одного параметра
+        assert any(param in data for param in ["temperature", "humidity", "windspeed", "precipitation"])
+    else:
+        # В случае проблем с API или временем
+        assert response.status_code in [400, 404, 500, 503]
+
+    # Тест с неверным временем
+    response = await test_app_fixture.get("/weather_forecast", params={
+        "user_id": user_id,
+        "city_name": "Berlin",
+        "time": "25:61"
+    })
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Invalid time format. Use HH:MM"
+
+    # Тест с неотслеживаемым городом
+    response = await test_app_fixture.get("/weather_forecast", params={
+        "user_id": user_id,
+        "city_name": "Paris",
+        "time": "12:00"
+    })
+    assert response.status_code == 404
+    assert response.json()["detail"] == "City not tracked by this user"
+
+    # Тест с несуществующим пользователем
+    response = await test_app_fixture.get("/weather_forecast", params={
+        "user_id": 999,
+        "city_name": "Berlin",
+        "time": "12:00"
+    })
+    assert response.status_code == 404
+    assert response.json()["detail"] == "User not found"
